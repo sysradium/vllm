@@ -24,6 +24,32 @@ from vllm.profiler import (
 )
 
 
+def get_generation_stats(llm, prompts, sampling_params):
+    """Helper function to compute generation_stats for FLOP estimation.
+
+    Args:
+        llm: The vLLM LLM instance
+        prompts: List of prompts or single prompt string
+        sampling_params: SamplingParams with max_tokens set
+
+    Returns:
+        dict: generation_stats dictionary for FlopContextManager
+    """
+    if isinstance(prompts, str):
+        prompts = [prompts]
+
+    # Calculate input statistics
+    tokenizer = llm.llm_engine.tokenizer
+    input_lengths = [len(tokenizer.encode(prompt)) for prompt in prompts]
+    avg_input_length = sum(input_lengths) // len(input_lengths)
+    batch_size = len(prompts)
+
+    return {
+        "input_shape": (batch_size, avg_input_length),
+        "num_generated_tokens": sampling_params.max_tokens,
+    }
+
+
 def basic_flop_counting_example():
     """Example using FlopContextManager for basic FLOP counting."""
     print("=== Basic FLOP Counting Example ===")
@@ -42,18 +68,12 @@ def basic_flop_counting_example():
     ]
 
     # Generate with FLOP counting (using enhanced offline counter)
-    with FlopContextManager(auto_print=False) as flop_counter:
-        # Set up model-based FLOP estimation as fallback
-        model_config = llm.llm_engine.model_config.hf_config
-        avg_input_len = sum(
-            len(llm.llm_engine.tokenizer.encode(p)) for p in prompts
-        ) // len(prompts)
-        generation_stats = {
-            "input_shape": (len(prompts), avg_input_len),
-            "num_generated_tokens": sampling_params.max_tokens,
-        }
-        flop_counter.set_model_for_estimation(model_config, generation_stats)
+    model_config = llm.llm_engine.model_config.hf_config
+    generation_stats = get_generation_stats(llm, prompts, sampling_params)
 
+    with FlopContextManager(
+        auto_print=False, model_config=model_config, generation_stats=generation_stats
+    ) as flop_counter:
         outputs = llm.generate(prompts, sampling_params)
 
     # Additional detailed analysis
@@ -88,15 +108,13 @@ def layerwise_profiling_with_flops_example():
 
     prompt = "The quick brown fox"
 
+    # Set up model estimation parameters
+    model_config = llm.llm_engine.model_config.hf_config
+    generation_stats = get_generation_stats(llm, [prompt], sampling_params)
+
     # Profile with FLOP counting enabled
     with layerwise_profile(num_running_seqs=1, enable_flop_counting=True) as profiler:
         # Set up model-based FLOP estimation as fallback
-        model_config = llm.llm_engine.model_config.hf_config
-        input_ids = llm.llm_engine.tokenizer.encode(prompt)
-        generation_stats = {
-            "input_shape": (1, len(input_ids)),
-            "num_generated_tokens": sampling_params.max_tokens,
-        }
         profiler.flop_counter.set_model_for_estimation(model_config, generation_stats)
 
         start_time = time.time()
@@ -138,17 +156,16 @@ def performance_analysis_example():
             llm = LLM(model=model_name, max_num_seqs=1)
             sampling_params = SamplingParams(temperature=0.0, max_tokens=10)
 
-            start_time = time.time()
-            with FlopContextManager() as flop_counter:
-                # Set up model-based FLOP estimation as fallback
-                model_config = llm.llm_engine.model_config.hf_config
-                input_ids = llm.llm_engine.tokenizer.encode("Hello world")
-                generation_stats = {
-                    "input_shape": (1, len(input_ids)),
-                    "num_generated_tokens": sampling_params.max_tokens,
-                }
-                flop_counter.set_model_for_estimation(model_config, generation_stats)
+            # Set up model estimation parameters
+            model_config = llm.llm_engine.model_config.hf_config
+            generation_stats = get_generation_stats(
+                llm, ["Hello world"], sampling_params
+            )
 
+            start_time = time.time()
+            with FlopContextManager(
+                model_config=model_config, generation_stats=generation_stats
+            ) as flop_counter:
                 outputs = llm.generate(["Hello world"], sampling_params)
             elapsed_time = time.time() - start_time
 
@@ -207,16 +224,14 @@ def multi_model_comparison_example():
             llm = LLM(model=model_info["model_id"], max_num_seqs=1)
             sampling_params = SamplingParams(temperature=0.0, max_tokens=20)
 
-            # Set up FLOP counting with model-specific estimation
-            with FlopContextManager() as flop_counter:
-                model_config = llm.llm_engine.model_config.hf_config
-                input_ids = llm.llm_engine.tokenizer.encode(test_prompt)
-                generation_stats = {
-                    "input_shape": (1, len(input_ids)),
-                    "num_generated_tokens": sampling_params.max_tokens,
-                }
-                flop_counter.set_model_for_estimation(model_config, generation_stats)
+            # Set up model estimation parameters
+            model_config = llm.llm_engine.model_config.hf_config
+            generation_stats = get_generation_stats(llm, [test_prompt], sampling_params)
 
+            # Set up FLOP counting with model-specific estimation
+            with FlopContextManager(
+                model_config=model_config, generation_stats=generation_stats
+            ) as flop_counter:
                 start_time = time.time()
                 outputs = llm.generate([test_prompt], sampling_params)
                 end_time = time.time()

@@ -327,12 +327,16 @@ class ModelFlopEstimator:
 
 class FlopCounter:
 
-    def __init__(self, display: bool = False, use_model_flops: bool = True):
+    def __init__(self, display: bool = False, model_config=None):
         self._display = display
         self._flop_mode: FlopCounterMode | None = None
         self._detailed_counts = DetailedFlopCount()
-        self._use_model_flops = use_model_flops
+        self._model_config = model_config
         self._model_flop_estimator = None
+
+        # Set up model estimation if config is provided
+        if model_config is not None:
+            self._model_flop_estimator = ModelFlopEstimator(model_config)
 
     def get_total_flops(self) -> int:
         if self._flop_mode is None:
@@ -404,10 +408,15 @@ class FlopCounter:
 
     def set_model_for_estimation(self, model_config, generation_stats=None):
         """Set model config for FLOP estimation when PyTorch counting fails."""
-        if self._use_model_flops:
-            self._model_flop_estimator = ModelFlopEstimator(model_config)
-            if generation_stats:
-                self._apply_model_flop_estimation(generation_stats)
+        self._model_config = model_config
+        self._model_flop_estimator = ModelFlopEstimator(model_config)
+        if generation_stats:
+            self._apply_model_flop_estimation(generation_stats)
+
+    def apply_generation_stats(self, generation_stats):
+        """Apply generation statistics for model-based FLOP estimation."""
+        if self._model_flop_estimator:
+            self._apply_model_flop_estimation(generation_stats)
 
     def _apply_model_flop_estimation(self, generation_stats):
         """Apply model-based FLOP estimation using generation statistics."""
@@ -744,14 +753,28 @@ class FlopCounter:
 
 
 @contextmanager
-def FlopContextManager(display: bool = False, auto_print: bool = False):
+def FlopContextManager(display: bool = False,
+                       auto_print: bool = False,
+                       model_config=None,
+                       generation_stats=None):
     """Context manager for FLOP counting in offline analysis.
     
     Args:
         display: Whether to display detailed PyTorch FLOP table
         auto_print: Whether to automatically print analysis summary on exit
+        model_config: Model configuration for model-based FLOP estimation.
+                     If provided, enables estimation that works with vLLM's
+                     optimized kernels.
+        generation_stats: Dictionary with 'input_shape' and
+                         'num_generated_tokens'.
+                         Example: {'input_shape': (1, 20),
+                         'num_generated_tokens': 50}
     """
-    counter = FlopCounter(display=display)
+    counter = FlopCounter(display=display, model_config=model_config)
+
+    if generation_stats and model_config is not None:
+        counter.apply_generation_stats(generation_stats)
+
     start_time = None
 
     try:
