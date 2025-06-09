@@ -41,6 +41,7 @@ class FlopCount:
 @dataclass
 class DetailedFlopCount:
     operation_counts: dict[str, int] = field(default_factory=dict)
+    layer_counts: dict[str, 'FlopCount'] = field(default_factory=dict)
     total_flops: int = 0
     mm_flops: int = 0
     attention_flops: int = 0
