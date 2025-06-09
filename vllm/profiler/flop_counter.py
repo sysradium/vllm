@@ -161,6 +161,14 @@ class FlopCounter:
         self._detailed_counts.total_flops = self.get_total_flops()
         self._detailed_counts.operation_counts = global_flops
 
+        layer_counts = {}
+        for module_name, ops in raw_flops.items():
+            if module_name != 'Global':
+                total_flops = sum(ops.values())
+                layer_counts[module_name] = FlopCount(total_flops=total_flops,
+                                                      flop_counts=dict(ops))
+        self._detailed_counts.layer_counts = layer_counts
+
         # Get categorized breakdown
         breakdown = self.get_flop_breakdown()
         self._detailed_counts.mm_flops = breakdown['mm_flops']
