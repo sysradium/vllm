@@ -82,17 +82,118 @@ class DetailedFlopCount:
         }
 
 
+class ModelFlopEstimator:
+    """Estimates FLOPs based on model architecture when PyTorch counter fails."""
+
+    def __init__(self, model_config):
+        self.config = model_config
+        self.vocab_size = getattr(model_config, 'vocab_size', 32000)
+        self.hidden_size = getattr(model_config, 'hidden_size', 4096)
+        self.num_layers = getattr(model_config, 'num_hidden_layers', 32)
+        self.num_heads = getattr(model_config, 'num_attention_heads', 32)
+        self.intermediate_size = getattr(model_config, 'intermediate_size',
+                                         4 * self.hidden_size)
+        self.head_dim = self.hidden_size // self.num_heads
+
+    def estimate_forward_pass_flops(self,
+                                    batch_size: int,
+                                    seq_len: int,
+                                    past_length: int = 0) -> int:
+        """Estimate FLOPs for a single forward pass."""
+        total_seq_len = seq_len + past_length
+        flops = 0
+
+        # For each transformer layer
+        for _ in range(self.num_layers):
+            # Self-attention
+            # Q, K, V projections: 3 * (batch * seq_len * hidden_size^2)
+            flops += (3 * batch_size * seq_len * self.hidden_size *
+                      self.hidden_size)
+
+            # Attention computation: Q @ K^T
+            flops += (batch_size * self.num_heads * seq_len * total_seq_len *
+                      self.head_dim)
+
+            # Softmax (approximate as 3 ops per element)
+            flops += batch_size * self.num_heads * seq_len * total_seq_len * 3
+
+            # Attention @ V
+            flops += (batch_size * self.num_heads * seq_len * total_seq_len *
+                      self.head_dim)
+
+            # Output projection
+            flops += batch_size * seq_len * self.hidden_size * self.hidden_size
+
+            # MLP
+            # Up projection
+            flops += (batch_size * seq_len * self.hidden_size *
+                      self.intermediate_size)
+            # Activation (SiLU/GELU - approximate as 8 ops per element)
+            flops += batch_size * seq_len * self.intermediate_size * 8
+            # Down projection
+            flops += (batch_size * seq_len * self.intermediate_size *
+                      self.hidden_size)
+
+            # Layer norms (approximate as 5 ops per element)
+            # Operations: mean, var, sub, div, mul+add
+            flops += 2 * batch_size * seq_len * self.hidden_size * 5
+
+        # Final layer norm
+        flops += batch_size * seq_len * self.hidden_size * 5
+
+        # LM head projection (only for last token in generation)
+        if seq_len == 1:  # Generation mode
+            flops += batch_size * self.hidden_size * self.vocab_size
+        else:  # Prefill mode
+            flops += batch_size * seq_len * self.hidden_size * self.vocab_size
+
+        return flops
+
+    def estimate_generation_flops(self, input_ids_shape,
+                                  num_generated_tokens: int) -> dict:
+        """Estimate total FLOPs for prefill + generation."""
+        batch_size, input_seq_len = input_ids_shape
+
+        # Prefill phase
+        prefill_flops = self.estimate_forward_pass_flops(
+            batch_size, input_seq_len, 0)
+
+        # Generation phase (decode one token at a time)
+        decode_flops = 0
+        for i in range(num_generated_tokens):
+            current_past_length = input_seq_len + i
+            decode_flops += self.estimate_forward_pass_flops(
+                batch_size, 1, current_past_length)
+
+        total_flops = prefill_flops + decode_flops
+
+        return {
+            'total_flops': total_flops,
+            'prefill_flops': prefill_flops,
+            'decode_flops': decode_flops,
+            'tokens_generated': num_generated_tokens
+        }
+
+
 class FlopCounter:
 
-    def __init__(self, display: bool = False):
+    def __init__(self, display: bool = False, use_model_flops: bool = True):
         self._display = display
         self._flop_mode: FlopCounterMode | None = None
         self._detailed_counts = DetailedFlopCount()
+        self._use_model_flops = use_model_flops
+        self._model_flop_estimator = None
 
     def get_total_flops(self) -> int:
         if self._flop_mode is None:
-            return 0
-        return self._flop_mode.get_total_flops()
+            return self._detailed_counts.total_flops
+
+        pytorch_total = self._flop_mode.get_total_flops()
+        if pytorch_total == 0 and self._detailed_counts.total_flops > 0:
+            # PyTorch counter failed, use model estimation
+            return self._detailed_counts.total_flops
+
+        return pytorch_total
 
     def get_flop_breakdown(self) -> dict[str, int]:
         """Get categorized FLOP breakdown with enhanced categorization."""
@@ -151,6 +252,48 @@ class FlopCounter:
             'other_flops': other_flops
         }
 
+    def set_model_for_estimation(self, model_config, generation_stats=None):
+        """Set model configuration for FLOP estimation when PyTorch counting fails."""
+        if self._use_model_flops:
+            self._model_flop_estimator = ModelFlopEstimator(model_config)
+            if generation_stats:
+                self._apply_model_flop_estimation(generation_stats)
+
+    def _apply_model_flop_estimation(self, generation_stats):
+        """Apply model-based FLOP estimation using generation statistics."""
+        if not self._model_flop_estimator:
+            return
+
+        input_shape = generation_stats.get('input_shape', (1, 10))
+        num_generated = generation_stats.get('num_generated_tokens', 20)
+
+        flop_breakdown = self._model_flop_estimator.estimate_generation_flops(
+            input_shape, num_generated)
+
+        # Update detailed counts with estimated values
+        self._detailed_counts.total_flops = flop_breakdown['total_flops']
+
+        # Rough breakdown by operation type (percentages based on typical transformer models)
+        total = flop_breakdown['total_flops']
+        self._detailed_counts.mm_flops = int(total *
+                                             0.85)  # Matrix multiply dominates
+        self._detailed_counts.attention_flops = int(total *
+                                                    0.10)  # Attention overhead
+        self._detailed_counts.activation_flops = int(total *
+                                                     0.02)  # Activations
+        self._detailed_counts.normalization_flops = int(total *
+                                                        0.01)  # LayerNorms
+        self._detailed_counts.embedding_flops = int(total * 0.01)  # Embeddings
+        self._detailed_counts.other_flops = int(total * 0.01)  # Misc
+
+        # Create layer counts (simplified)
+        avg_flops_per_layer = total // self._model_flop_estimator.num_layers
+        for i in range(self._model_flop_estimator.num_layers):
+            layer_name = f"model.layers.{i}"
+            self._detailed_counts.layer_counts[layer_name] = FlopCount(
+                total_flops=avg_flops_per_layer,
+                flop_counts={f"layer_{i}_ops": avg_flops_per_layer})
+
     def get_detailed_counts(self) -> DetailedFlopCount:
         if self._flop_mode is None:
             return self._detailed_counts
@@ -158,7 +301,18 @@ class FlopCounter:
         raw_flops = self._flop_mode.get_flop_counts()
         global_flops = raw_flops.get('Global', {})
 
-        self._detailed_counts.total_flops = self.get_total_flops()
+        # Check if PyTorch FLOP counter captured anything
+        pytorch_total = self._flop_mode.get_total_flops()
+
+        if pytorch_total == 0 and self._model_flop_estimator:
+            # PyTorch counter failed, but we have estimates - use them
+            print(
+                "PyTorch FLOP counter captured 0 FLOPs, using model-based estimation"
+            )
+            return self._detailed_counts
+
+        # PyTorch counter worked - use its data
+        self._detailed_counts.total_flops = pytorch_total
         self._detailed_counts.operation_counts = global_flops
 
         layer_counts = {}

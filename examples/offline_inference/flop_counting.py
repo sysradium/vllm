@@ -42,13 +42,27 @@ def basic_flop_counting_example():
     ]
 
     # Generate with FLOP counting (using enhanced offline counter)
-    with FlopContextManager(auto_print=True) as flop_counter:
+    with FlopContextManager(auto_print=False) as flop_counter:
+        # Set up model-based FLOP estimation as fallback
+        model_config = llm.llm_engine.model_config.hf_config
+        avg_input_len = sum(
+            len(llm.llm_engine.tokenizer.encode(p)) for p in prompts
+        ) // len(prompts)
+        generation_stats = {
+            "input_shape": (len(prompts), avg_input_len),
+            "num_generated_tokens": sampling_params.max_tokens,
+        }
+        flop_counter.set_model_for_estimation(model_config, generation_stats)
+
         outputs = llm.generate(prompts, sampling_params)
 
     # Additional detailed analysis
     detailed_counts = flop_counter.get_detailed_counts()
-    breakdown_percentages = detailed_counts.get_percentage_breakdown()
+    total_flops = flop_counter.get_total_flops()
 
+    print(f"\nTotal FLOPs: {format_flops(total_flops)}")
+
+    breakdown_percentages = detailed_counts.get_percentage_breakdown()
     print("\nDetailed FLOP Breakdown by Percentage:")
     for category, percentage in breakdown_percentages.items():
         if percentage > 0 and category != "total_flops":
@@ -76,6 +90,15 @@ def layerwise_profiling_with_flops_example():
 
     # Profile with FLOP counting enabled
     with layerwise_profile(num_running_seqs=1, enable_flop_counting=True) as profiler:
+        # Set up model-based FLOP estimation as fallback
+        model_config = llm.llm_engine.model_config.hf_config
+        input_ids = llm.llm_engine.tokenizer.encode(prompt)
+        generation_stats = {
+            "input_shape": (1, len(input_ids)),
+            "num_generated_tokens": sampling_params.max_tokens,
+        }
+        profiler.flop_counter.set_model_for_estimation(model_config, generation_stats)
+
         start_time = time.time()
         outputs = llm.generate([prompt], sampling_params)
         end_time = time.time()
