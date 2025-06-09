@@ -140,6 +140,15 @@ def performance_analysis_example():
 
             start_time = time.time()
             with FlopContextManager() as flop_counter:
+                # Set up model-based FLOP estimation as fallback
+                model_config = llm.llm_engine.model_config.hf_config
+                input_ids = llm.llm_engine.tokenizer.encode("Hello world")
+                generation_stats = {
+                    "input_shape": (1, len(input_ids)),
+                    "num_generated_tokens": sampling_params.max_tokens,
+                }
+                flop_counter.set_model_for_estimation(model_config, generation_stats)
+
                 outputs = llm.generate(["Hello world"], sampling_params)
             elapsed_time = time.time() - start_time
 
